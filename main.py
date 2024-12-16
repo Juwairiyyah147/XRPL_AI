@@ -29,7 +29,7 @@ from xrpl.models import Payment, AccountInfo, NFTokenMint, TrustSet
 from xrpl.utils import xrp_to_drops
 import json
 from datetime import datetime
-
+import re
 # Enhanced logging setup
 logger.remove()
 
@@ -353,32 +353,97 @@ conversation = RunnableWithMessageHistory(
     output_messages_key="output",
 )
 
+def clean_and_preprocess_document(content: str) -> str:
+    logger.debug("Starting document cleaning and preprocessing")
+    
+    # Remove common noise patterns
+    logger.debug("Removing noise patterns")
+    patterns_to_remove = [
+        r'Text from https:\/\/www\.youtube\.com\/embed\S+.*?Try watching this video on www\.youtube\.com.*?\n',
+        r'Text from https:\/\/livenet\.xrpl\.org.*?JavaScript to run this app\.',
+        r'\[(\d+)\]',  # Remove reference numbers
+        r'^\s*Table of Contents\s*$.*?(?=\n\n)',  # Remove table of contents
+        r'Click here to scroll to this section',
+    ]
+    
+    for pattern in patterns_to_remove:
+        content = re.sub(pattern, '', content, flags=re.DOTALL)
+    
+    # Extract sections with headers
+    logger.debug("Extracting sections with headers")
+    sections = []
+    current_section = []
+    
+    for line in content.split('\n'):
+        # Identify headers (lines that are shorter and end with common header patterns)
+        if re.match(r'^[A-Z][^.!?]{0,50}(?:[:.)]|\s*)$', line.strip()):
+            if current_section:
+                sections.append('\n'.join(current_section))
+                current_section = []
+        current_section.append(line.strip())
+    
+    if current_section:
+        sections.append('\n'.join(current_section))
+    
+    # Join sections with clear delimiters
+    cleaned_content = '\n====================\n'.join(
+        section.strip() for section in sections if section.strip()
+    )
+    
+    logger.debug(f"Document preprocessing complete. Original length: {len(content)}, New length: {len(cleaned_content)}")
+    return cleaned_content
 
 async def process_chunks(chunks: List[Document], vector_store: AstraDBVectorStore) -> None:
-    logger.info(f"Processing chunks with content: {[chunk.page_content[:100] for chunk in chunks]}")
+    logger.info(f"Processing {len(chunks)} chunks")
     batch_size = 25
     max_retries = 3
-    logger.info(f"Starting to process {len(chunks)} chunks in batches of {batch_size}")
-
+    
     async def process_batch(batch, batch_num):
+        processed_batch = []
+        for i, chunk in enumerate(batch):
+            try:
+                # Classify the chunk
+                classification = await classify_chunk_theme(chunk.page_content)
+                
+                # Create enhanced document with classification metadata
+                enhanced_doc = Document(
+                    page_content=chunk.page_content,
+                    metadata={
+                        **chunk.metadata,
+                        "theme": classification["theme"],
+                        "topics": classification["topics"],
+                        "complexity": classification["complexity"],
+                        "summary": classification["summary"],
+                        "batch_num": batch_num,
+                        "chunk_num": i,
+                    }
+                )
+                processed_batch.append(enhanced_doc)
+                logger.debug(f"Processed chunk {i} in batch {batch_num}: Theme={classification['theme']}")
+                
+            except Exception as e:
+                logger.error(f"Error processing chunk {i} in batch {batch_num}: {e}")
+                # Keep original chunk if processing fails
+                processed_batch.append(chunk)
+        
+        # Add batch to vector store with retries
         for attempt in range(max_retries):
             try:
-                logger.info(f"Processing batch {batch_num} with {len(batch)} chunks (attempt {attempt + 1})")
                 await asyncio.to_thread(
                     vector_store.add_documents,
-                    batch,
-                    ids=[f"doc_{batch_num}_{i}" for i in range(len(batch))]
+                    processed_batch,
+                    ids=[f"doc_{batch_num}_{i}" for i in range(len(processed_batch))]
                 )
-                logger.info(f"Completed batch {batch_num}")
+                logger.info(f"Successfully added batch {batch_num} to vector store")
                 return
             except Exception as e:
                 if attempt == max_retries - 1:
-                    logger.error(f"Error processing batch {batch_num} after {max_retries} attempts: {e}")
+                    logger.error(f"Failed to add batch {batch_num} after {max_retries} attempts: {e}")
                     raise
                 logger.warning(f"Attempt {attempt + 1} failed for batch {batch_num}: {e}. Retrying...")
-                await asyncio.sleep(1)  # Wait before retry
-
-    # Process batches sequentially instead of concurrently
+                await asyncio.sleep(1)
+    
+    # Process batches sequentially
     for i in range(0, len(chunks), batch_size):
         batch = chunks[i : i + batch_size]
         batch_num = i // batch_size + 1
@@ -388,7 +453,7 @@ async def process_chunks(chunks: List[Document], vector_store: AstraDBVectorStor
             logger.error(f"Failed to process batch {batch_num}: {e}")
             raise
 
-    logger.info("All batches processed successfully")
+    logger.info("All chunks processed and stored successfully")
 
 
 async def process_single_document(file, vector_store: AstraDBVectorStore) -> Tuple[bool, str]:
@@ -414,15 +479,26 @@ async def process_single_document(file, vector_store: AstraDBVectorStore) -> Tup
         # Load document based on file type
         if file_extension == ".pdf":
             loader = PyPDFLoader(tmp_file_path)
+            documents = await asyncio.to_thread(loader.load)
         elif file_extension == ".txt":
             loader = TextLoader(tmp_file_path, encoding='utf-8')
+            documents = await asyncio.to_thread(loader.load)
+            # Clean and preprocess the document content
+            logger.debug("Cleaning and preprocessing document content")
+            cleaned_content = clean_and_preprocess_document(documents[0].page_content)
+            
+            # Create new document with cleaned content
+            documents = [Document(
+                page_content=cleaned_content,
+                metadata={"source": file.name}
+            )]
         elif file_extension in [".doc", ".docx"]:
             loader = UnstructuredWordDocumentLoader(tmp_file_path)
+            documents = await asyncio.to_thread(loader.load)
         else:
             raise ValueError(f"Unsupported file type: {file_extension}")
 
         logger.debug("Loading document content")
-        documents = await asyncio.to_thread(loader.load)
         
         # Initial chunking
         logger.debug("Initial document splitting")
@@ -810,9 +886,72 @@ async def clear_and_recreate_collection():
     except Exception as e:
         logger.error(f"Error clearing collection: {e}")
         return False
+async def preprocess_with_llm(text: str) -> str:
+    # Create a proper prompt template
+    preprocess_prompt = ChatPromptTemplate.from_messages([
+        ("system", """Analyze this text and ensure it's a complete, self-contained piece of information. 
+        If incomplete, expand it with relevant context. Keep it focused and coherent.
+        The output should be a self-contained piece of documentation."""),
+        ("human", "{text}")
+    ])
+    
+    # Format the prompt with the text
+    formatted_prompt = await preprocess_prompt.ainvoke({"text": text})
+    
+    # Send to LLM and get response
+    response = await llm.ainvoke(formatted_prompt)
+    
+    # Extract the content from response
+    if hasattr(response, 'content'):
+        return response.content
+    return str(response)
+
+async def classify_chunk_theme(text: str) -> dict:
+    """Classify the theme of a text chunk using LLM."""
+    classification_prompt = ChatPromptTemplate.from_messages([
+        ("system", """You are a document classifier for XRPL documentation.
+        Analyze the text and:
+        1. Identify the main theme (e.g., Tutorials, API Methods, Use Cases, Concepts, etc.)
+        2. Extract key topics covered
+        3. Determine the technical complexity level (Beginner, Intermediate, Advanced)
+        
+        Return the analysis as JSON in this format:
+        {
+            "theme": "main_theme",
+            "topics": ["topic1", "topic2"],
+            "complexity": "level",
+            "summary": "brief_summary"
+        }"""),
+        ("human", "{text}")
+    ])
+    
+    try:
+        # Format prompt with chunk text
+        formatted_prompt = await classification_prompt.ainvoke({"text": text})
+        
+        # Get classification from LLM
+        response = await llm.ainvoke(formatted_prompt)
+        
+        # Parse JSON response
+        if hasattr(response, 'content'):
+            classification = json.loads(response.content)
+        else:
+            classification = json.loads(str(response))
+            
+        logger.debug(f"Chunk classified as: {classification['theme']}")
+        return classification
+        
+    except Exception as e:
+        logger.error(f"Error classifying chunk: {e}")
+        return {
+            "theme": "Unknown",
+            "topics": [],
+            "complexity": "Unknown",
+            "summary": "Classification failed"
+        }
 
 
-# Then the Streamlit UI section starts
+# The Streamlit UI section starts
 st.title("XRPL AI Wallet")
 logger.info("Starting XRPL AI Wallet UI")
 
@@ -914,22 +1053,4 @@ if prompt := st.chat_input("Ask about XRPL or request a transaction:"):
     with st.chat_message("assistant"):
         st.markdown(response)
 
-async def preprocess_with_llm(text: str) -> str:
-    # Create a proper prompt template
-    preprocess_prompt = ChatPromptTemplate.from_messages([
-        ("system", """Analyze this text and ensure it's a complete, self-contained piece of information. 
-        If incomplete, expand it with relevant context. Keep it focused and coherent.
-        The output should be a self-contained piece of documentation."""),
-        ("human", "{text}")
-    ])
-    
-    # Format the prompt with the text
-    formatted_prompt = await preprocess_prompt.ainvoke({"text": text})
-    
-    # Send to LLM and get response
-    response = await llm.ainvoke(formatted_prompt)
-    
-    # Extract the content from response
-    if hasattr(response, 'content'):
-        return response.content
-    return str(response)
+
