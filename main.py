@@ -25,11 +25,14 @@ import sys
 import xrpl
 from xrpl.clients import JsonRpcClient
 from xrpl.wallet import Wallet
-from xrpl.models import Payment, AccountInfo, NFTokenMint, TrustSet
+from xrpl.models import Payment, AccountInfo, NFTokenMint, TrustSet, TicketCreate
 from xrpl.utils import xrp_to_drops
 import json
 from datetime import datetime
 import re
+from pymongo import MongoClient
+from pathlib import Path
+
 # Enhanced logging setup
 logger.remove()
 
@@ -75,6 +78,9 @@ GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 MODEL_NAME = "gemini-1.5-pro-002"
 EMBEDDING_MODEL = "models/embedding-001"
 XRPL_TESTNET_URL = "https://s.altnet.rippletest.net:51234/"
+MONGO_URI = os.getenv("MONGO_URI")
+MONGO_DB_NAME = os.getenv("MONGO_DB_NAME")
+MONGO_COLLECTION = os.getenv("MONGO_COLLECTION")
 
 logger.debug(
     f"Configuration loaded: ASTRA_DB_API_ENDPOINT={ASTRA_DB_API_ENDPOINT}, COLLECTION_NAME={COLLECTION_NAME}, MODEL_NAME={MODEL_NAME}"
@@ -210,6 +216,7 @@ def create_wallet(client):
     """Create a new XRPL wallet with enhanced logging"""
     logger.info("Creating new XRPL wallet...")
     try:
+        # Uses XRPL's faucet to generate a funded testnet wallet
         wallet = xrpl.wallet.generate_faucet_wallet(client)
         logger.debug(
             f"Wallet details: Address={wallet.classic_address}, Public Key={wallet.public_key}"
@@ -246,17 +253,21 @@ async def prepare_transaction(transaction_type, params, client, wallet):
     logger.debug(f"Transaction parameters: {params}")
 
     try:
-        if transaction_type == "Payment":
-            logger.debug(
-                f"Creating Payment transaction: destination={params['destination']}, amount={params['amount']}"
+        if transaction_type == "TicketCreate":
+            logger.debug("Creating TicketCreate transaction")
+            transaction = TicketCreate(
+                account=wallet.classic_address,  # Note: lowercase 'account'
+                ticket_count=int(params.get("TicketCount", 1))  # Convert to int
             )
+            logger.debug(f"Created TicketCreate transaction: {transaction.to_dict()}")
+
+        elif transaction_type == "Payment":
             transaction = Payment(
                 account=wallet.classic_address,
                 destination=params["destination"],
                 amount=xrp_to_drops(params["amount"]),
             )
         elif transaction_type == "NFTokenMint":
-            logger.debug(f"Creating NFTokenMint transaction: uri={params['uri']}")
             transaction = NFTokenMint(
                 account=wallet.classic_address,
                 uri=params["uri"],
@@ -265,11 +276,9 @@ async def prepare_transaction(transaction_type, params, client, wallet):
                 nftoken_taxon=params.get("nftoken_taxon", 0),
             )
         elif transaction_type == "TrustSet":
-            logger.debug(
-                f"Creating TrustSet transaction: limit_amount={params['limit_amount']}"
-            )
             transaction = TrustSet(
-                account=wallet.classic_address, limit_amount=params["limit_amount"]
+                account=wallet.classic_address, 
+                limit_amount=params["limit_amount"]
             )
         else:
             logger.error(f"Unsupported transaction type: {transaction_type}")
@@ -289,11 +298,7 @@ async def prepare_transaction(transaction_type, params, client, wallet):
 
 async def submit_transaction(prepared_tx, client, wallet):
     """Submit a signed transaction to XRPL with enhanced logging"""
-    logger.info("Submitting transaction to XRPL...")
-    logger.debug(f"Prepared transaction: {prepared_tx.to_dict()}")
-
     try:
-        logger.debug("Signing and submitting transaction...")
         response = xrpl.transaction.submit_and_wait(prepared_tx, client, wallet)
         logger.info(f"Transaction submitted successfully: {response.result}")
         return response.result
@@ -626,11 +631,38 @@ async def chat_with_knowledge_base(question, source=None, chat_history=None):
         ]
     )
 
+    # Check if this is a transaction creation request
+    if "transaction payload" in question.lower():
+        try:
+            if "wallet" not in st.session_state:
+                return "Please create a wallet first before requesting transaction payloads."
+            
+            wallet = st.session_state.wallet
+            
+            # Extract transaction type from question
+            if "TicketCreate" in question:
+                params = {
+                    "TransactionType": "TicketCreate",
+                    "Account": wallet.classic_address,
+                    "TicketCount": 1  # Default value
+                }
+                
+                return f"""Here's the transaction payload for TicketCreate:
+```json
+{json.dumps(params, indent=2)}
+```
+Would you like me to prepare and submit this transaction?"""
+                
+        except Exception as e:
+            logger.error(f"Error creating transaction payload: {e}")
+            return f"Error creating transaction payload: {str(e)}"
+
+    # For non-transaction requests, use RAG
     logger.debug("Creating history aware retriever")
     history_aware_retriever = create_history_aware_retriever(
         llm, retriever, contextualize_q_prompt
     )
-
+    
     logger.debug("Setting up QA system prompt")
     qa_system_prompt = """You are an XRPL expert assistant. Use the retrieved context to:
     1. Answer questions about XRPL concepts and features
@@ -638,8 +670,8 @@ async def chat_with_knowledge_base(question, source=None, chat_history=None):
     3. Provide guidance on wallet management
     4. Explain technical details clearly
     
-    If you don't know the answer, just say so.
-    Keep answers concise and use three sentences maximum.
+    If you don't know the answer, just say so. Keep answers concise.
+    
     
     {context}"""
 
@@ -916,12 +948,12 @@ async def classify_chunk_theme(text: str) -> dict:
         3. Determine the technical complexity level (Beginner, Intermediate, Advanced)
         
         Return the analysis as JSON in this format:
-        {
+        {{
             "theme": "main_theme",
             "topics": ["topic1", "topic2"],
             "complexity": "level",
             "summary": "brief_summary"
-        }"""),
+        }}"""),  # Note the double curly braces for escaping
         ("human", "{text}")
     ])
     
@@ -951,6 +983,58 @@ async def classify_chunk_theme(text: str) -> dict:
         }
 
 
+
+def initialize_mongo():
+    """Initialize MongoDB connection"""
+    try:
+        client = MongoClient(MONGO_URI)
+        db = client[MONGO_DB_NAME]
+        logger.debug("MongoDB connection initialized")
+        return db
+    except Exception as e:
+        logger.error(f"Failed to initialize MongoDB: {e}")
+        raise
+
+def save_wallet(wallet_data):
+    """Save wallet to MongoDB"""
+    try:
+        db = initialize_mongo()
+        wallet_doc = {
+            "address": wallet_data.classic_address,
+            "public_key": wallet_data.public_key,
+            "created_at": datetime.utcnow(),
+            "last_accessed": datetime.utcnow()
+        }
+        
+        # Check if wallet already exists
+        existing_wallet = db[MONGO_COLLECTION].find_one({"address": wallet_data.classic_address})
+        if existing_wallet:
+            logger.warning(f"Wallet {wallet_data.classic_address} already exists in database")
+            return False
+            
+        db[MONGO_COLLECTION].insert_one(wallet_doc)
+        logger.info(f"Wallet saved to database: {wallet_data.classic_address}")
+        return True
+        
+    except Exception as e:
+        logger.error(f"Error saving wallet to MongoDB: {e}")
+        raise
+
+def get_wallet(address):
+    """Retrieve wallet from MongoDB"""
+    try:
+        db = initialize_mongo()
+        wallet = db[MONGO_COLLECTION].find_one({"address": address})
+        if wallet:
+            logger.debug(f"Retrieved wallet: {address}")
+            return wallet
+        logger.warning(f"Wallet not found: {address}")
+        return None
+    except Exception as e:
+        logger.error(f"Error retrieving wallet from MongoDB: {e}")
+        raise
+
+
 # The Streamlit UI section starts
 st.title("XRPL AI Wallet")
 logger.info("Starting XRPL AI Wallet UI")
@@ -970,14 +1054,24 @@ with st.sidebar:
     st.header("Wallet Management")
     logger.debug("Rendering wallet management sidebar")
 
-    if "wallet" not in st.session_state:
-        if st.button("Create New Wallet"):
+    if st.button("Create New Wallet"):
+        if "wallet" in st.session_state:
+            logger.info("Wallet already exists")
+            st.warning("You already have a wallet")
+        else:
             logger.info("Creating new wallet")
             try:
                 wallet = create_wallet(st.session_state.xrpl_client)
                 st.session_state.wallet = wallet
-                logger.success(f"New wallet created: {wallet.classic_address}")
-                st.success(f"Wallet created: {wallet.classic_address}")
+                
+                # Save to MongoDB
+                if save_wallet(wallet):
+                    logger.success(f"New wallet created and saved: {wallet.classic_address}")
+                    st.success(f"Wallet created: {wallet.classic_address}")
+                else:
+                    logger.warning("Wallet already exists in database")
+                    st.warning("This wallet already exists in the database")
+                    
             except Exception as e:
                 logger.error(f"Failed to create wallet: {e}")
                 st.error("Failed to create wallet. Please try again.")
@@ -1052,5 +1146,62 @@ if prompt := st.chat_input("Ask about XRPL or request a transaction:"):
 
     with st.chat_message("assistant"):
         st.markdown(response)
+        
+        # Check if response contains a transaction payload
+        if "```json" in response and "Would you like me to prepare and submit this transaction?" in response:
+            # Create container for transaction review
+            review_container = st.container()
+            
+            with review_container:
+                # Show review button
+                if st.button("📝 Review Transaction", type="secondary"):
+                    # Transaction details section
+                    st.markdown("### 🔍 Transaction Review")
+                    
+                    # Extract and parse JSON
+                    json_str = response[response.find("```json") + 7 : response.rfind("```")].strip()
+                    tx_data = json.loads(json_str)
+                    
+                    # Display details in two columns
+                    left_col, right_col = st.columns(2)
+                    
+                    with left_col:
+                        st.markdown("#### Transaction Summary")
+                        st.markdown(f"**Type:** {tx_data['TransactionType']}")
+                        st.markdown(f"**Account:** {tx_data['Account']}")
+                        for key, value in tx_data.items():
+                            if key not in ['TransactionType', 'Account']:
+                                st.markdown(f"**{key}:** {value}")
+                    
+                    with right_col:
+                        st.markdown("#### Raw Transaction")
+                        st.code(json.dumps(tx_data, indent=2), language="json")
+                    
+                    # Warning and submit button
+                    st.warning("⚠️ Please review the transaction details carefully")
+                    
+                    if st.button("🚀 Submit Transaction", type="primary"):
+                        with st.spinner("Processing transaction..."):
+                            try:
+                                async def process_transaction():
+                                    prepared_tx = await prepare_transaction(
+                                        tx_data["TransactionType"],
+                                        tx_data,
+                                        st.session_state.xrpl_client,
+                                        st.session_state.wallet
+                                    )
+                                    result = await submit_transaction(
+                                        prepared_tx,
+                                        st.session_state.xrpl_client,
+                                        st.session_state.wallet
+                                    )
+                                    return result
+                                
+                                result = asyncio.run(process_transaction())
+                                st.success("✅ Transaction submitted successfully!")
+                                st.json(result)
+                                
+                            except Exception as e:
+                                st.error(f"❌ Transaction failed: {str(e)}")
 
 
