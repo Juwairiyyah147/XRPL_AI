@@ -593,7 +593,6 @@ async def chat_with_knowledge_base(question, source=None, chat_history=None):
     retriever = vector_store.as_retriever(search_kwargs=search_kwargs)
     logger.info("Retriever created")
 
-    
     try:
         logger.info("Retrieving relevant documents")
         relevant_docs = await asyncio.to_thread(retriever.get_relevant_documents, question)
@@ -609,13 +608,9 @@ async def chat_with_knowledge_base(question, source=None, chat_history=None):
     if not relevant_docs:
         logger.warning("No relevant documents found")
         if source:
-            msg = f"I couldn't find any relevant information in the specified source: {source}. Would you like to search all sources instead?"
-            logger.info(f"Returning source-specific no results message: {msg}")
-            return msg
+            return f"I couldn't find any relevant information in the specified source: {source}. Would you like to search all sources instead?"
         else:
-            msg = "I couldn't find any relevant information to answer your question. Could you please rephrase or ask a different question?"
-            logger.info(f"Returning general no results message: {msg}")
-            return msg
+            return "I couldn't find any relevant information to answer your question. Could you please rephrase or ask a different question?"
 
     logger.debug("Setting up contextualization prompt")
     contextualize_q_system_prompt = """Given a chat history and the latest user question \
@@ -636,20 +631,72 @@ async def chat_with_knowledge_base(question, source=None, chat_history=None):
         try:
             if "wallet" not in st.session_state:
                 return "Please create a wallet first before requesting transaction payloads."
-            
+
             wallet = st.session_state.wallet
+
+            # Extract transaction details from question using LLM
+            tx_prompt = ChatPromptTemplate.from_messages([
+                ("system", """Extract transaction details from the user request. Your response must be a valid JSON object, with no additional text, comments, or formatting.
+    Ensure the response does not contain markdown or code block markers like ```json.
+                Return a JSON object with:
+                {{
+                    "TransactionType": "<type>",
+                    "Parameters": {{ "key": "value", ... }}
+                }}
+                Ensure the JSON is valid and complete.
+
+                Supported types: Payment, NFTokenMint, TrustSet, TicketCreate"""),
+                ("human", "{text}")
+            ])
+
+            # Get transaction details from LLM
+            formatted_prompt = await tx_prompt.ainvoke({"text": question})
+            response = await llm.ainvoke(formatted_prompt)
+
+            # Log raw response for debugging
+            logger.debug(f"Raw AI response: {response}")
+
+            if not response or not hasattr(response, 'content'):
+                logger.error("Empty or invalid response from AI model")
+                return "Error: AI model did not return a valid response. Please refine your request."
             
-            # Extract transaction type from question
-            if "TicketCreate" in question:
-                params = {
-                    "TransactionType": "TicketCreate",
-                    "Account": wallet.classic_address,
-                    "TicketCount": 1  # Default value
-                }
-                
-                return f"""Here's the transaction payload for TicketCreate:
+            raw_content = response.content.strip()
+            # Remove code block markers if present
+            if raw_content.startswith("```json") and raw_content.endswith("```"):
+                raw_content = raw_content[7:-3].strip()
+            
+            # Attempt to parse the response as JSON
+            try:
+                tx_details = json.loads(raw_content)
+                logger.debug(f"Parsed transaction details: {tx_details}")
+            except json.JSONDecodeError as e:
+                logger.error(f"Error parsing transaction JSON: {raw_content} - {e}")
+                return "Error: Failed to parse transaction payload. Please try again with more specific details."
+
+            # Create transaction parameters
+            params = {
+                "TransactionType": tx_details["TransactionType"],
+                "Account": wallet.classic_address,
+                **tx_details["Parameters"]
+            }
+
+            # Validate parameters using prepare_transaction
+            try:
+                await asyncio.to_thread(prepare_transaction,
+                    params["TransactionType"],
+                    params,
+                    st.session_state.xrpl_client,
+                    wallet
+                )
+                logger.debug(f"Transaction parameters validated: {params}")
+            except Exception as e:
+                logger.error(f"Invalid transaction parameters: {e}")
+                return f"Error in transaction parameters: {str(e)}"
+
+            return f"""Here's the transaction payload for {params['TransactionType']}:
 ```json
 {json.dumps(params, indent=2)}
+
 ```
 Would you like me to prepare and submit this transaction?"""
                 
@@ -694,34 +741,6 @@ Would you like me to prepare and submit this transaction?"""
 
     answer = response["answer"]
     logger.info(f"Generated answer: {answer}")
-
-    # Check for transaction JSON in response
-    if "```json" in answer and "```" in answer:
-        logger.info("Transaction JSON detected in response")
-        try:
-            json_str = answer[answer.find("```json") + 7 : answer.rfind("```")].strip()
-            logger.debug(f"Extracted JSON string: {json_str}")
-            transaction_data = json.loads(json_str)
-            logger.debug(f"Parsed transaction data: {transaction_data}")
-
-            if st.button("Confirm Transaction"):
-                logger.info("Transaction confirmation requested")
-                client = initialize_xrpl_client()
-                logger.debug("Preparing transaction")
-                prepared_tx = await prepare_transaction(
-                    transaction_data["TransactionType"],
-                    transaction_data,
-                    client,
-                    wallet,
-                )
-                logger.info("Submitting transaction")
-                result = await submit_transaction(prepared_tx, client, wallet)
-                logger.info(f"Transaction result: {result}")
-                st.success(f"Transaction submitted: {result}")
-
-        except Exception as e:
-            logger.error(f"Error processing transaction: {e}", exc_info=True)
-            st.error("Error processing transaction. Please check the format.")
 
     return answer
 
@@ -1147,13 +1166,11 @@ if prompt := st.chat_input("Ask about XRPL or request a transaction:"):
     with st.chat_message("assistant"):
         st.markdown(response)
         
-        # Check if response contains a transaction payload
+        # Single transaction handling flow
         if "```json" in response and "Would you like me to prepare and submit this transaction?" in response:
-            # Create container for transaction review
             review_container = st.container()
             
             with review_container:
-                # Show review button
                 if st.button("📝 Review Transaction", type="secondary"):
                     # Transaction details section
                     st.markdown("### 🔍 Transaction Review")
