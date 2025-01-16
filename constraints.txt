@@ -1,0 +1,6 @@
+"streamlit==1.31.1" --no-deps
+"python-dotenv==1.0.1" --no-deps
+"loguru==0.7.2" --no-deps
+#"google-generativeai==0.4.1" --no-deps
+"aiohttp==3.9.3" --no-deps
+"typing-extensions==4.9.0" --no-deps

@@ -256,50 +256,52 @@ async def prepare_transaction(transaction_type, params, client, wallet):
         if transaction_type == "TicketCreate":
             logger.debug("Creating TicketCreate transaction")
             transaction = TicketCreate(
-                account=wallet.classic_address,  # Note: lowercase 'account'
-                ticket_count=int(params.get("TicketCount", 1))  # Convert to int
+                account=wallet.classic_address,
+                ticket_count=int(params.get("TicketCount", 1))
             )
             logger.debug(f"Created TicketCreate transaction: {transaction.to_dict()}")
 
         elif transaction_type == "Payment":
             transaction = Payment(
                 account=wallet.classic_address,
-                destination=params["destination"],
-                amount=xrp_to_drops(params["amount"]),
+                destination=params["Destination"],
+                amount=xrp_to_drops(params["Amount"]),
             )
         elif transaction_type == "NFTokenMint":
             transaction = NFTokenMint(
                 account=wallet.classic_address,
-                uri=params["uri"],
-                flags=params.get("flags", 0),
-                transfer_fee=params.get("transfer_fee", 0),
-                nftoken_taxon=params.get("nftoken_taxon", 0),
+                uri=params["URI"],
+                flags=params.get("Flags", 0),
+                transfer_fee=params.get("TransferFee", 0),
+                nftoken_taxon=params.get("NFTokenTaxon", 0),
             )
         elif transaction_type == "TrustSet":
             transaction = TrustSet(
                 account=wallet.classic_address, 
-                limit_amount=params["limit_amount"]
+                limit_amount=params["LimitAmount"]
             )
         else:
             logger.error(f"Unsupported transaction type: {transaction_type}")
             raise ValueError(f"Unsupported transaction type: {transaction_type}")
 
         logger.debug(f"Transaction object created: {transaction.to_dict()}")
-        prepared = xrpl.transaction.autofill(transaction, client)
+        # Run synchronous function in thread executor
+        loop = asyncio.get_event_loop()
+        prepared = await loop.run_in_executor(None, xrpl.transaction.autofill, transaction, client)
         logger.debug(f"Transaction prepared with fees: {prepared.to_dict()}")
         logger.success(f"{transaction_type} transaction prepared successfully")
         return prepared
     except Exception as e:
-        logger.error(
-            f"Error preparing {transaction_type} transaction: {str(e)}", exc_info=True
-        )
+        logger.error(f"Error preparing {transaction_type} transaction: {str(e)}")
         raise
 
 
 async def submit_transaction(prepared_tx, client, wallet):
     """Submit a signed transaction to XRPL with enhanced logging"""
     try:
-        response = xrpl.transaction.submit_and_wait(prepared_tx, client, wallet)
+        # Run synchronous function in thread executor
+        loop = asyncio.get_event_loop()
+        response = await loop.run_in_executor(None, xrpl.transaction.submit_and_wait, prepared_tx, client, wallet)
         logger.info(f"Transaction submitted successfully: {response.result}")
         return response.result
     except Exception as e:
@@ -677,21 +679,27 @@ async def chat_with_knowledge_base(question, source=None, chat_history=None):
             params = {
                 "TransactionType": tx_details["TransactionType"],
                 "Account": wallet.classic_address,
-                **tx_details["Parameters"]
             }
-
-            # Validate parameters using prepare_transaction
-            try:
-                await asyncio.to_thread(prepare_transaction,
-                    params["TransactionType"],
-                    params,
-                    st.session_state.xrpl_client,
-                    wallet
-                )
-                logger.debug(f"Transaction parameters validated: {params}")
-            except Exception as e:
-                logger.error(f"Invalid transaction parameters: {e}")
-                return f"Error in transaction parameters: {str(e)}"
+            
+            # Add transaction-specific parameters
+            if tx_details["Parameters"]:
+                if tx_details["TransactionType"] == "TicketCreate":
+                    params["TicketCount"] = tx_details["Parameters"]["TicketCount"]
+                elif tx_details["TransactionType"] == "Payment":
+                    params["Destination"] = tx_details["Parameters"]["destination"]
+                    params["Amount"] = tx_details["Parameters"]["amount"]
+                elif tx_details["TransactionType"] == "NFTokenMint":
+                    params["URI"] = tx_details["Parameters"]["uri"]
+                    params["Flags"] = tx_details["Parameters"]["flags"]
+                    params["TransferFee"] = tx_details["Parameters"]["transfer_fee"]
+                    params["NFTokenTaxon"] = tx_details["Parameters"]["nftoken_taxon"]
+                elif tx_details["TransactionType"] == "TrustSet":
+                    params["LimitAmount"] = tx_details["Parameters"]["limit_amount"]
+                else:
+                    logger.error(f"Unsupported transaction type: {tx_details['TransactionType']}")
+                    return f"Error: Unsupported transaction type {tx_details['TransactionType']}"
+            
+            logger.debug(f"Created transaction parameters: {params}")
 
             return f"""Here's the transaction payload for {params['TransactionType']}:
 ```json
@@ -745,136 +753,7 @@ Would you like me to prepare and submit this transaction?"""
     return answer
 
 
-# Add helper function to prepare and validate transactions
-async def prepare_transaction_from_json(
-    tx_json: dict, client, wallet
-) -> Tuple[bool, str, Any]:
-    """
-    Prepare and validate a transaction from JSON format.
-    Returns (success, message, prepared_tx)
-    """
-    logger.info("Preparing transaction from JSON")
-    logger.debug(f"Transaction JSON: {tx_json}")
 
-    try:
-        # Validate transaction type
-        if "TransactionType" not in tx_json:
-            logger.error("Transaction type missing from JSON")
-            return False, "Transaction type is required", None
-
-        # Convert to proper transaction model
-        logger.debug("Converting to transaction model")
-        tx = xrpl.models.Transaction.from_xrpl(tx_json)
-        logger.debug(f"Created transaction model: {tx}")
-
-        # Autofill fields like fee, sequence, etc
-        logger.info("Autofilling transaction fields")
-        prepared_tx = await asyncio.to_thread(xrpl.transaction.autofill, tx, client)
-        logger.debug(f"Prepared transaction: {prepared_tx}")
-
-        # Basic validation
-        if not prepared_tx.is_valid():
-            logger.error("Transaction validation failed")
-            return False, "Invalid transaction after preparation", None
-
-        logger.success("Transaction prepared successfully")
-        return True, "Transaction prepared successfully", prepared_tx
-
-    except Exception as e:
-        logger.error(f"Error preparing transaction: {e}", exc_info=True)
-        return False, f"Error: {str(e)}", None
-
-
-# Update conversation handler to use enhanced transaction processing
-async def handle_conversation(question: str, session_id: str, client=None, wallet=None):
-    """Enhanced conversation handler with transaction support"""
-    logger.info(f"Handling conversation for session {session_id}")
-    logger.debug(f"Question: {question}")
-
-    try:
-        # Get relevant context from vector store
-        logger.info("Retrieving context from knowledge base")
-        context = await chat_with_knowledge_base(question)
-        logger.debug(f"Retrieved context: {context}")
-
-        # Add transaction context if available
-        if client and wallet:
-            logger.debug(f"Adding wallet context for address: {wallet.classic_address}")
-            context += f"\nActive wallet: {wallet.classic_address}"
-
-        # Process response through RAG chain
-        logger.info("Invoking conversation chain")
-        response = await conversation.ainvoke(
-            {"input": question, "session_id": session_id, "context": context}
-        )
-        logger.debug(f"Raw response: {response}")
-
-        # Check for transaction intent
-        if "TransactionType" in response:
-            logger.info("Transaction intent detected")
-            # Extract transaction JSON
-            try:
-                logger.debug("Parsing transaction JSON")
-                tx_json = json.loads(response)
-                logger.debug(f"Parsed transaction JSON: {tx_json}")
-
-                success, msg, prepared_tx = await prepare_transaction_from_json(
-                    tx_json, client, wallet
-                )
-
-                if not success:
-                    logger.error(f"Transaction preparation failed: {msg}")
-                    return f"Transaction preparation failed: {msg}"
-
-                # Ask for confirmation
-                logger.info("Preparing transaction confirmation message")
-                return {
-                    "type": "transaction_confirmation",
-                    "message": f"Ready to submit {tx_json['TransactionType']} transaction. Details:\n{json.dumps(prepared_tx.to_dict(), indent=2)}\n\nDo you want to proceed?",
-                    "prepared_tx": prepared_tx,
-                }
-
-            except json.JSONDecodeError as e:
-                logger.error(f"JSON parsing error: {e}", exc_info=True)
-                return "Could not parse transaction JSON from response"
-
-        logger.info("Returning conversation response")
-        return response
-
-    except Exception as e:
-        logger.error(f"Error in conversation handler: {e}", exc_info=True)
-        return f"Error processing request: {str(e)}"
-
-
-# Add transaction execution handler
-async def execute_transaction(prepared_tx, client, wallet):
-    """Execute a prepared transaction after confirmation"""
-    logger.info("Executing prepared transaction")
-    logger.debug(f"Transaction details: {prepared_tx}")
-
-    try:
-        logger.info("Submitting transaction")
-        result = await submit_transaction(prepared_tx, client, wallet)
-        logger.debug(f"Transaction result: {result}")
-
-        if result.is_successful():
-            logger.success("Transaction executed successfully")
-            return {
-                "success": True,
-                "message": "Transaction submitted successfully",
-                "details": result.result,
-            }
-        else:
-            logger.error(f"Transaction failed: {result.result}")
-            return {
-                "success": False,
-                "message": "Transaction failed",
-                "details": result.result,
-            }
-
-    except Exception as e:
-        logger.error(f"Transaction execution error: {e}", exc_info=True)
-        return {"success": False, "message": f"Error executing transaction: {str(e)}"}
 
 
 # Move this function up, after other async function definitions 
@@ -1054,6 +933,29 @@ def get_wallet(address):
         raise
 
 
+# Move this up, before the chat interface section
+async def process_transaction():
+    logger.debug("Preparing transaction")
+    prepared_tx = await prepare_transaction(
+        st.session_state.review_state["transaction"]["TransactionType"],
+        st.session_state.review_state["transaction"],
+        st.session_state.xrpl_client,
+        st.session_state.wallet
+    )
+    logger.debug("Submitting transaction")
+    result = await submit_transaction(
+        prepared_tx,
+        st.session_state.xrpl_client,
+        st.session_state.wallet
+    )
+    return result
+
+# Chat interface section starts here
+logger.debug("Initializing chat interface")
+if "messages" not in st.session_state:
+    logger.debug("Initializing empty message history")
+    st.session_state.messages = []
+
 # The Streamlit UI section starts
 st.title("XRPL AI Wallet")
 logger.info("Starting XRPL AI Wallet UI")
@@ -1099,6 +1001,30 @@ with st.sidebar:
 if "processed_files" not in st.session_state:
     st.session_state.processed_files = set()
 
+# Add this near the top where other session state variables are initialized
+if "show_review" not in st.session_state:
+    st.session_state.show_review = False
+    logger.debug("Initialized show_review state to False")
+
+if "current_transaction" not in st.session_state:
+    st.session_state.current_transaction = None
+    logger.debug("Initialized current_transaction state to None")
+
+# First, add this state initialization at the top with other state variables
+if "review_clicked" not in st.session_state:
+    st.session_state.review_clicked = False
+
+# Move this to the top where other session states are initialized (near "messages" initialization)
+if "review_state" not in st.session_state:
+    st.session_state.review_state = {
+        "showing": False,
+        "transaction": None
+    }
+
+# Add this to the session state initialization at the top
+if "last_response" not in st.session_state:
+    st.session_state.last_response = None
+
 # Document processing
 uploaded_files = st.file_uploader(
     "Upload XRPL documentation", type=["pdf", "txt"], accept_multiple_files=True
@@ -1124,7 +1050,7 @@ if uploaded_files:
     else:
         logger.info("No new files to process")
 
-# Add after the document upload section and before the chat interface
+
 col1, col2, col3 = st.columns([1, 1, 2])  # Create three columns for better layout
 with col1:
     if st.button("Inspect Vector Store"):
@@ -1159,66 +1085,80 @@ if prompt := st.chat_input("Ask about XRPL or request a transaction:"):
 
     with st.spinner("Thinking..."):
         logger.info("Processing chat response")
-        response = asyncio.run(chat_with_knowledge_base(prompt))
+        # Create and set new event loop for chat response
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        response = loop.run_until_complete(chat_with_knowledge_base(prompt))
+        loop.close()
+        
         logger.debug(f"Chat response generated: {response}")
         st.session_state.messages.append({"role": "assistant", "content": response})
 
     with st.chat_message("assistant"):
         st.markdown(response)
+        # Clear previous transaction state when new chat response comes
+        st.session_state.review_state["showing"] = False
+        st.session_state.review_state["transaction"] = None
+        st.session_state.last_response = response
+
+# Modify the review section to use st.empty()
+if st.session_state.last_response and "```json" in st.session_state.last_response and "Would you like me to prepare and submit this transaction?" in st.session_state.last_response:
+    review_container = st.container()
+    review_window = st.empty()
+    
+    with review_container:
+        # Extract transaction data only once
+        if not st.session_state.review_state["transaction"]:
+            try:
+                json_str = st.session_state.last_response[st.session_state.last_response.find("```json") + 7 : st.session_state.last_response.rfind("```")].strip()
+                tx_data = json.loads(json_str)
+                st.session_state.review_state["transaction"] = tx_data
+                logger.debug(f"Stored transaction data: {tx_data}")
+            except Exception as e:
+                logger.error(f"Error parsing JSON: {e}")
+                st.error("Error parsing transaction data")
+                st.stop()
         
-        # Single transaction handling flow
-        if "```json" in response and "Would you like me to prepare and submit this transaction?" in response:
-            review_container = st.container()
-            
-            with review_container:
-                if st.button("📝 Review Transaction", type="secondary"):
-                    # Transaction details section
-                    st.markdown("### 🔍 Transaction Review")
-                    
-                    # Extract and parse JSON
-                    json_str = response[response.find("```json") + 7 : response.rfind("```")].strip()
-                    tx_data = json.loads(json_str)
-                    
-                    # Display details in two columns
-                    left_col, right_col = st.columns(2)
-                    
-                    with left_col:
-                        st.markdown("#### Transaction Summary")
-                        st.markdown(f"**Type:** {tx_data['TransactionType']}")
-                        st.markdown(f"**Account:** {tx_data['Account']}")
-                        for key, value in tx_data.items():
-                            if key not in ['TransactionType', 'Account']:
-                                st.markdown(f"**{key}:** {value}")
-                    
-                    with right_col:
-                        st.markdown("#### Raw Transaction")
-                        st.code(json.dumps(tx_data, indent=2), language="json")
-                    
-                    # Warning and submit button
-                    st.warning("⚠️ Please review the transaction details carefully")
-                    
-                    if st.button("🚀 Submit Transaction", type="primary"):
+        # Always show the review button
+        if st.button("📝 Review Transaction", key="review_btn"):
+            st.session_state.review_state["showing"] = True
+        
+        # Show/hide only the review window
+        if st.session_state.review_state["showing"]:
+            with review_window.container():
+                st.markdown("### 🔍 Transaction Review")
+                
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.markdown("#### Transaction Summary")
+                    for key, value in st.session_state.review_state["transaction"].items():
+                        st.markdown(f"**{key}:** {value}")
+                
+                with col2:
+                    st.markdown("#### Raw Transaction")
+                    st.code(json.dumps(st.session_state.review_state["transaction"], indent=2))
+                
+                st.warning("⚠️ Please review the transaction details carefully")
+                
+                col1, col2, _ = st.columns([1, 2, 3])
+                with col1:
+                    if st.button("❌ Close", key="close_btn"):
+                        st.session_state.review_state["showing"] = False
+        
+                with col2:
+                    if st.button("🚀 Submit", key="submit_btn", type="primary"):
                         with st.spinner("Processing transaction..."):
                             try:
-                                async def process_transaction():
-                                    prepared_tx = await prepare_transaction(
-                                        tx_data["TransactionType"],
-                                        tx_data,
-                                        st.session_state.xrpl_client,
-                                        st.session_state.wallet
-                                    )
-                                    result = await submit_transaction(
-                                        prepared_tx,
-                                        st.session_state.xrpl_client,
-                                        st.session_state.wallet
-                                    )
-                                    return result
+                                # Create and set a new event loop
+                                loop = asyncio.new_event_loop()
+                                asyncio.set_event_loop(loop)
+                                result = loop.run_until_complete(process_transaction())
+                                loop.close()
                                 
-                                result = asyncio.run(process_transaction())
                                 st.success("✅ Transaction submitted successfully!")
-                                st.json(result)
-                                
+                                #st.json(result)
+                                st.session_state.review_state["showing"] = False
+                                st.session_state.review_state["transaction"] = None
                             except Exception as e:
+                                logger.error(f"Transaction failed: {str(e)}")
                                 st.error(f"❌ Transaction failed: {str(e)}")
-
-
