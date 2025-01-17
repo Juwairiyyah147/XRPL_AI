@@ -575,6 +575,32 @@ async def process_multiple_documents(files) -> List[Tuple[str, bool]]:
     logger.info(f"Processed {len(processed_results)} documents")
     return processed_results
 
+def get_parameter_case_insensitive(params_dict: dict, param_name: str) -> tuple[Any, bool]:
+    """
+    Get parameter value using case-insensitive matching.
+    For single-word parameters, uses simple lower() comparison.
+    For multi-word parameters, removes spaces and uses lower().
+    Returns tuple of (value, found_status)
+    """
+    # Check if param_name contains spaces
+    if " " in param_name:
+        clean_param_name = param_name.lower().replace(" ", "")
+        param_key = next(
+            (k for k in params_dict.keys() 
+             if k.lower().replace(" ", "") == clean_param_name),
+            None
+        )
+    else:
+        # Simple case-insensitive match for single-word parameters
+        param_key = next(
+            (k for k in params_dict.keys() 
+             if k.lower() == param_name.lower()),
+            None
+        )
+    
+    if param_key:
+        return params_dict[param_key], True
+    return None, False
 
 async def chat_with_knowledge_base(question, source=None, chat_history=None):
     logger.info(f"Processing chat request - Question: {question}, Source: {source}")
@@ -683,21 +709,56 @@ async def chat_with_knowledge_base(question, source=None, chat_history=None):
             
             # Add transaction-specific parameters
             if tx_details["Parameters"]:
-                if tx_details["TransactionType"] == "TicketCreate":
-                    params["TicketCount"] = tx_details["Parameters"]["TicketCount"]
-                elif tx_details["TransactionType"] == "Payment":
-                    params["Destination"] = tx_details["Parameters"]["destination"]
-                    params["Amount"] = tx_details["Parameters"]["amount"]
-                elif tx_details["TransactionType"] == "NFTokenMint":
-                    params["URI"] = tx_details["Parameters"]["uri"]
-                    params["Flags"] = tx_details["Parameters"]["flags"]
-                    params["TransferFee"] = tx_details["Parameters"]["transfer_fee"]
-                    params["NFTokenTaxon"] = tx_details["Parameters"]["nftoken_taxon"]
-                elif tx_details["TransactionType"] == "TrustSet":
-                    params["LimitAmount"] = tx_details["Parameters"]["limit_amount"]
-                else:
-                    logger.error(f"Unsupported transaction type: {tx_details['TransactionType']}")
-                    return f"Error: Unsupported transaction type {tx_details['TransactionType']}"
+                if tx_details["TransactionType"].lower() == "TicketCreate".lower():
+                    ticket_count, found = get_parameter_case_insensitive(tx_details["Parameters"], "TicketCount")
+                    if found:
+                        params["TicketCount"] = ticket_count
+                    else:
+                        logger.error("TicketCount parameter not found in any format")
+                        return "Error: TicketCount parameter is required for TicketCreate transaction"
+                        
+                elif tx_details["TransactionType"].lower() == "Payment".lower():
+                    destination, found_dest = get_parameter_case_insensitive(tx_details["Parameters"], "Destination")
+                    amount, found_amount = get_parameter_case_insensitive(tx_details["Parameters"], "Amount")
+                    if not (found_dest and found_amount):
+                        missing = []
+                        if not found_dest: missing.append("Destination")
+                        if not found_amount: missing.append("Amount")
+                        return f"Error: Missing required parameters: {', '.join(missing)}"
+                    params["Destination"] = destination
+                    params["Amount"] = amount
+                    
+                elif tx_details["TransactionType"].lower() == "NFTokenMint".lower():
+                    required_params = {
+                        "URI": "URI",
+                        "Flags": "Flags",
+                        "TransferFee": "TransferFee",
+                        "NFTokenTaxon": "NFTokenTaxon"
+                    }
+                    missing = []
+                    for param_key, param_name in required_params.items():
+                        value, found = get_parameter_case_insensitive(tx_details["Parameters"], param_name)
+                        if found:
+                            params[param_key] = value
+                        else:
+                            missing.append(param_name)
+                    if missing:
+                        return f"Error: Missing required parameters: {', '.join(missing)}"
+                        
+                elif tx_details["TransactionType"].lower() == "TrustSet".lower():
+                    limit_amount, found = get_parameter_case_insensitive(tx_details["Parameters"], "LimitAmount")
+                    if found:
+                        # Check if LimitAmount is in correct format
+                        if isinstance(limit_amount, dict) and all(k in limit_amount for k in ["currency", "issuer", "value"]):
+                            params["LimitAmount"] = {
+                                "currency": str(limit_amount["currency"]).upper(),
+                                "issuer": str(limit_amount["issuer"]),
+                                "value": str(limit_amount["value"])  # Ensure value is string
+                            }
+                        else:
+                            return "Error: LimitAmount must contain currency, issuer, and value"
+                    else:
+                        return "Error: LimitAmount parameter is required for TrustSet transaction"
             
             logger.debug(f"Created transaction parameters: {params}")
 
@@ -1162,3 +1223,4 @@ if st.session_state.last_response and "```json" in st.session_state.last_respons
                             except Exception as e:
                                 logger.error(f"Transaction failed: {str(e)}")
                                 st.error(f"❌ Transaction failed: {str(e)}")
+
