@@ -310,55 +310,32 @@ async def submit_transaction(prepared_tx, client, wallet):
 
 
 # Update system prompt to be more comprehensive
-system_prompt = """You are an advanced AI assistant specializing in the XRP Ledger (XRPL). You can:
+#   system_prompt = """You are an advanced AI assistant specializing in the XRP Ledger (XRPL). You can:
 
-1. Help users interact with XRPL through natural language
-2. Analyze and explain XRPL concepts, features and transactions
-3. Assist with wallet management and transaction preparation
-4. Guide users through complex operations step by step
+#1. Help users interact with XRPL through natural language
+#2. Analyze and explain XRPL concepts, features and transactions
+#3. Assist with wallet management and transaction preparation
+#4. Guide users through complex operations step by step
 
-For transactions, you will:
-1. Extract relevant parameters from user requests
-2. Format them into proper transaction objects
-3. Explain the implications and costs
-4. Ask for explicit confirmation before executing
-5. Provide clear feedback on results
 
-When preparing transactions, format them as JSON like:
-
-{
-    "TransactionType": "<type>",
-    "Account": "<source>",
-    // ... other fields specific to transaction type
-}
-
-Always verify critical details like:
-- Transaction type is valid
-- Amounts are properly formatted
-- Addresses are valid
-- Required fields are present
-- Fee is appropriate
-
-Ask for clarification if any required information is missing."""
-
-prompt = ChatPromptTemplate.from_messages(
-    [
-        ("system", system_prompt),
-        MessagesPlaceholder(variable_name="chat_history"),
-        ("human", "{input}"),
-    ]
-)
+#prompt = ChatPromptTemplate.from_messages(
+#    [
+#        ("system", system_prompt),
+#        MessagesPlaceholder(variable_name="chat_history"),
+#        ("human", "{input}"),
+#    ]
+#)
 
 # Create chain and conversation handler
-chain = prompt | llm | StrOutputParser()
+#chain = prompt | llm | StrOutputParser()
 
-conversation = RunnableWithMessageHistory(
-    chain,
-    get_session_history=get_session_history,
-    input_messages_key="input",
-    history_messages_key="chat_history",
-    output_messages_key="output",
-)
+#conversation = RunnableWithMessageHistory(
+#    chain,
+#    get_session_history=get_session_history,
+#    input_messages_key="input",
+#    history_messages_key="chat_history",
+#    output_messages_key="output",
+#)
 
 def clean_and_preprocess_document(content: str) -> str:
     logger.debug("Starting document cleaning and preprocessing")
@@ -602,61 +579,8 @@ def get_parameter_case_insensitive(params_dict: dict, param_name: str) -> tuple[
         return params_dict[param_key], True
     return None, False
 
-async def chat_with_knowledge_base(question, source=None, chat_history=None):
-    logger.info(f"Processing chat request - Question: {question}, Source: {source}")
-
-    if chat_history is None:
-        chat_history = []
-    logger.debug(f"Chat history length: {len(chat_history)}")
-
-    vector_store = initialize_vector_store()
-    logger.debug("Vector store initialized for chat")
-
-    search_kwargs = {"k": 10}
-    if source:
-        search_kwargs["filter"] = {"metadata": {"source": source}}
-        logger.debug(f"Added source filter: {source}")
-
-    logger.debug("Creating retriever with search kwargs")
-    retriever = vector_store.as_retriever(search_kwargs=search_kwargs)
-    logger.info("Retriever created")
-
+async def transaction_request(question):
     try:
-        logger.info("Retrieving relevant documents")
-        relevant_docs = await asyncio.to_thread(retriever.get_relevant_documents, question)
-        logger.debug(f"Retrieved {len(relevant_docs)} relevant documents")
-    except Exception as e:
-        logger.error(f"Error retrieving relevant documents: {e}")
-        return "Error retrieving relevant documents. Please try again."
-
-    # Log retrieved text content
-    for i, doc in enumerate(relevant_docs):
-        logger.info(f"Retrieved document {i+1}: {doc.page_content[:200]}...")
-
-    if not relevant_docs:
-        logger.warning("No relevant documents found")
-        if source:
-            return f"I couldn't find any relevant information in the specified source: {source}. Would you like to search all sources instead?"
-        else:
-            return "I couldn't find any relevant information to answer your question. Could you please rephrase or ask a different question?"
-
-    logger.debug("Setting up contextualization prompt")
-    contextualize_q_system_prompt = """Given a chat history and the latest user question \
-    which might reference context in the chat history, formulate a standalone question \
-    which can be understood without the chat history. Do NOT answer the question, \
-    just reformulate it if needed and otherwise return it as is."""
-
-    contextualize_q_prompt = ChatPromptTemplate.from_messages(
-        [
-            ("system", contextualize_q_system_prompt),
-            MessagesPlaceholder("chat_history"),
-            ("human", "{input}"),
-        ]
-    )
-
-    # Check if this is a transaction creation request
-    if "transaction payload" in question.lower():
-        try:
             if "wallet" not in st.session_state:
                 return "Please create a wallet first before requesting transaction payloads."
 
@@ -664,7 +588,8 @@ async def chat_with_knowledge_base(question, source=None, chat_history=None):
 
             # Extract transaction details from question using LLM
             tx_prompt = ChatPromptTemplate.from_messages([
-                ("system", """Extract transaction details from the user request. Your response must be a valid JSON object, with no additional text, comments, or formatting.
+                ("system", """ 
+                Extract transaction details from the user request. Your response must be a valid JSON object, with no additional text, comments, or formatting.
     Ensure the response does not contain markdown or code block markers like ```json.
                 Return a JSON object with:
                 {{
@@ -673,7 +598,8 @@ async def chat_with_knowledge_base(question, source=None, chat_history=None):
                 }}
                 Ensure the JSON is valid and complete.
 
-                Supported types: Payment, NFTokenMint, TrustSet, TicketCreate"""),
+                Supported types: Payment, NFTokenMint, TrustSet, TicketCreate
+                """),
                 ("human", "{text}")
             ])
 
@@ -769,10 +695,67 @@ async def chat_with_knowledge_base(question, source=None, chat_history=None):
 ```
 Would you like me to prepare and submit this transaction?"""
                 
-        except Exception as e:
-            logger.error(f"Error creating transaction payload: {e}")
-            return f"Error creating transaction payload: {str(e)}"
+    except Exception as e:
+        logger.error(f"Error creating transaction payload: {e}")
+        return f"Error creating transaction payload: {str(e)}"
 
+
+async def chat_with_knowledge_base(question, source=None, chat_history=None):
+    logger.info(f"Processing chat request - Question: {question}, Source: {source}")
+
+    if chat_history is None:
+        chat_history = []
+    logger.debug(f"Chat history length: {len(chat_history)}")
+
+    vector_store = initialize_vector_store()
+    logger.debug("Vector store initialized for chat")
+
+    search_kwargs = {"k": 10}
+    if source:
+        search_kwargs["filter"] = {"metadata": {"source": source}}
+        logger.debug(f"Added source filter: {source}")
+
+    logger.debug("Creating retriever with search kwargs")
+    retriever = vector_store.as_retriever(search_kwargs=search_kwargs)
+    logger.info("Retriever created")
+
+    try:
+        logger.info("Retrieving relevant documents")
+        relevant_docs = await asyncio.to_thread(retriever.get_relevant_documents, question)
+        logger.debug(f"Retrieved {len(relevant_docs)} relevant documents")
+    except Exception as e:
+        logger.error(f"Error retrieving relevant documents: {e}")
+        return "Error retrieving relevant documents. Please try again."
+
+    # Log retrieved text content
+    for i, doc in enumerate(relevant_docs):
+        logger.info(f"Retrieved document {i+1}: {doc.page_content[:200]}...")
+
+    if not relevant_docs:
+        logger.warning("No relevant documents found")
+        if source:
+            return f"I couldn't find any relevant information in the specified source: {source}. Would you like to search all sources instead?"
+        else:
+            return "I couldn't find any relevant information to answer your question. Could you please rephrase or ask a different question?"
+
+    logger.debug("Setting up contextualization prompt")
+    contextualize_q_system_prompt = """Given a chat history and the latest user question \
+    which might reference context in the chat history, formulate a standalone question \
+    which can be understood without the chat history. Do NOT answer the question, \
+    just reformulate it if needed and otherwise return it as is."""
+
+    contextualize_q_prompt = ChatPromptTemplate.from_messages(
+        [
+            ("system", contextualize_q_system_prompt),
+            MessagesPlaceholder("chat_history"),
+            ("human", "{input}"),
+        ]
+    )
+
+    #! Created a separate function for transaction requests
+    #if "transaction payload" in question.lower():
+    #    return transaction_request(question)
+    
     # For non-transaction requests, use RAG
     logger.debug("Creating history aware retriever")
     history_aware_retriever = create_history_aware_retriever(
@@ -815,9 +798,6 @@ Would you like me to prepare and submit this transaction?"""
 
 
 
-
-
-# Move this function up, after other async function definitions 
 # and before the Streamlit UI section
 async def inspect_vector_store():
     vector_store = initialize_vector_store()
@@ -994,7 +974,6 @@ def get_wallet(address):
         raise
 
 
-# Move this up, before the chat interface section
 async def process_transaction():
     logger.debug("Preparing transaction")
     prepared_tx = await prepare_transaction(
@@ -1149,7 +1128,13 @@ if prompt := st.chat_input("Ask about XRPL or request a transaction:"):
         # Create and set new event loop for chat response
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-        response = loop.run_until_complete(chat_with_knowledge_base(prompt))
+        
+        # Check if it's a transaction request
+        if "transaction payload" in prompt.lower():
+            response = loop.run_until_complete(transaction_request(prompt))
+        else:
+            response = loop.run_until_complete(chat_with_knowledge_base(prompt))
+        
         loop.close()
         
         logger.debug(f"Chat response generated: {response}")
