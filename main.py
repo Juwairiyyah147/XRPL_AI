@@ -247,52 +247,27 @@ def get_account_info(client, wallet):
         raise
 
 
-async def prepare_transaction(transaction_type, params, client, wallet):
+async def prepare_transaction(tx_json, client, wallet):
     """Prepare an XRPL transaction with enhanced logging"""
-    logger.info(f"Preparing {transaction_type} transaction...")
-    logger.debug(f"Transaction parameters: {params}")
+    logger.info(f"Preparing {tx_json.get('transaction_type', 'UNKNOWN')} transaction...")
+    logger.debug(f"Input transaction JSON: {tx_json}")
+    logger.debug(f"JSON keys: {list(tx_json.keys())}")
 
     try:
-        if transaction_type == "TicketCreate":
-            logger.debug("Creating TicketCreate transaction")
-            transaction = TicketCreate(
-                account=wallet.classic_address,
-                ticket_count=int(params.get("TicketCount", 1))
-            )
-            logger.debug(f"Created TicketCreate transaction: {transaction.to_dict()}")
+        # Create transaction from JSON using generic Transaction model
+        transaction = xrpl.models.transactions.Transaction.from_dict(tx_json)
+        logger.debug(f"Created transaction object: {transaction.to_dict()}")
+        logger.debug(f"Transaction object type: {type(transaction)}")
 
-        elif transaction_type == "Payment":
-            transaction = Payment(
-                account=wallet.classic_address,
-                destination=params["Destination"],
-                amount=xrp_to_drops(params["Amount"]),
-            )
-        elif transaction_type == "NFTokenMint":
-            transaction = NFTokenMint(
-                account=wallet.classic_address,
-                uri=params["URI"],
-                flags=params.get("Flags", 0),
-                transfer_fee=params.get("TransferFee", 0),
-                nftoken_taxon=params.get("NFTokenTaxon", 0),
-            )
-        elif transaction_type == "TrustSet":
-            transaction = TrustSet(
-                account=wallet.classic_address, 
-                limit_amount=params["LimitAmount"]
-            )
-        else:
-            logger.error(f"Unsupported transaction type: {transaction_type}")
-            raise ValueError(f"Unsupported transaction type: {transaction_type}")
-
-        logger.debug(f"Transaction object created: {transaction.to_dict()}")
         # Run synchronous function in thread executor
         loop = asyncio.get_event_loop()
         prepared = await loop.run_in_executor(None, xrpl.transaction.autofill, transaction, client)
         logger.debug(f"Transaction prepared with fees: {prepared.to_dict()}")
-        logger.success(f"{transaction_type} transaction prepared successfully")
+        logger.success(f"{tx_json.get('transaction_type', 'UNKNOWN')} transaction prepared successfully")
         return prepared
     except Exception as e:
-        logger.error(f"Error preparing {transaction_type} transaction: {str(e)}")
+        logger.error(f"Error preparing transaction: {str(e)}", exc_info=True)
+        logger.error(f"Transaction JSON that caused error: {tx_json}")
         raise
 
 
@@ -552,146 +527,61 @@ async def process_multiple_documents(files) -> List[Tuple[str, bool]]:
     logger.info(f"Processed {len(processed_results)} documents")
     return processed_results
 
-def get_parameter_case_insensitive(params_dict: dict, param_name: str) -> tuple[Any, bool]:
-    """
-    Get parameter value using case-insensitive matching.
-    For single-word parameters, uses simple lower() comparison.
-    For multi-word parameters, removes spaces and uses lower().
-    Returns tuple of (value, found_status)
-    """
-    # Check if param_name contains spaces
-    if " " in param_name:
-        clean_param_name = param_name.lower().replace(" ", "")
-        param_key = next(
-            (k for k in params_dict.keys() 
-             if k.lower().replace(" ", "") == clean_param_name),
-            None
-        )
-    else:
-        # Simple case-insensitive match for single-word parameters
-        param_key = next(
-            (k for k in params_dict.keys() 
-             if k.lower() == param_name.lower()),
-            None
-        )
-    
-    if param_key:
-        return params_dict[param_key], True
-    return None, False
+
 
 async def transaction_request(question):
     try:
-            if "wallet" not in st.session_state:
-                return "Please create a wallet first before requesting transaction payloads."
+        if "wallet" not in st.session_state:
+            return "Please create a wallet first before requesting transaction payloads."
 
-            wallet = st.session_state.wallet
+        wallet = st.session_state.wallet
 
-            # Extract transaction details from question using LLM
-            tx_prompt = ChatPromptTemplate.from_messages([
-                ("system", """ 
-                Extract transaction details from the user request. Your response must be a valid JSON object, with no additional text, comments, or formatting.
-    Ensure the response does not contain markdown or code block markers like ```json.
-                Return a JSON object with:
-                {{
-                    "TransactionType": "<type>",
-                    "Parameters": {{ "key": "value", ... }}
-                }}
-                Ensure the JSON is valid and complete.
+        # Extract transaction details from question using LLM
+        tx_prompt = ChatPromptTemplate.from_messages([
+            ("system", """
+            Extract transaction details from the user request. Return a valid JSON object with:
+            {{
+                "transaction_type": "<type>",
+                "Parameters": {{ ... transaction specific parameters ... }}
+            }}
+            Supported types: TicketCreate, Payment, NFTokenMint, TrustSet  # Proper case for transaction types
+            Note: transaction_type should be in proper case (e.g., TicketCreate, not ticketcreate or Ticketcreate. its your job to change it to correct case)
+            Note: All the parameters should be in lower case (e.g., ticket_count, not TicketCount) Its your job to change it to correct format.
+            """),
+            ("human", "{text}")
+        ])
 
-                Supported types: Payment, NFTokenMint, TrustSet, TicketCreate
-                """),
-                ("human", "{text}")
-            ])
+        # Get transaction details from LLM
+        formatted_prompt = await tx_prompt.ainvoke({"text": question})
+        response = await llm.ainvoke(formatted_prompt)
+        
+        logger.debug(f"LLM response: {response}")
 
-            # Get transaction details from LLM
-            formatted_prompt = await tx_prompt.ainvoke({"text": question})
-            response = await llm.ainvoke(formatted_prompt)
+        # Clean the response content
+        content = response.content.strip()
+        if content.startswith("```json"):
+            content = content[7:]  # Remove ```json
+        if content.endswith("```"):
+            content = content[:-3]  # Remove ```
+        content = content.strip()
+        
+        logger.debug(f"Cleaned JSON content: {content}")
+        
+        # Parse the response
+        tx_details = json.loads(content)
+        
+        # Add the Account field to the transaction
+        tx_json = {
+            "transaction_type": tx_details["transaction_type"],
+            "account": wallet.classic_address,
+            **tx_details["Parameters"]  # Keep original parameter case
+        }
 
-            # Log raw response for debugging
-            logger.debug(f"Raw AI response: {response}")
+        logger.debug(f"Created transaction JSON: {tx_json}")
 
-            if not response or not hasattr(response, 'content'):
-                logger.error("Empty or invalid response from AI model")
-                return "Error: AI model did not return a valid response. Please refine your request."
-            
-            raw_content = response.content.strip()
-            # Remove code block markers if present
-            if raw_content.startswith("```json") and raw_content.endswith("```"):
-                raw_content = raw_content[7:-3].strip()
-            
-            # Attempt to parse the response as JSON
-            try:
-                tx_details = json.loads(raw_content)
-                logger.debug(f"Parsed transaction details: {tx_details}")
-            except json.JSONDecodeError as e:
-                logger.error(f"Error parsing transaction JSON: {raw_content} - {e}")
-                return "Error: Failed to parse transaction payload. Please try again with more specific details."
-
-            # Create transaction parameters
-            params = {
-                "TransactionType": tx_details["TransactionType"],
-                "Account": wallet.classic_address,
-            }
-            
-            # Add transaction-specific parameters
-            if tx_details["Parameters"]:
-                if tx_details["TransactionType"].lower() == "TicketCreate".lower():
-                    ticket_count, found = get_parameter_case_insensitive(tx_details["Parameters"], "TicketCount")
-                    if found:
-                        params["TicketCount"] = ticket_count
-                    else:
-                        logger.error("TicketCount parameter not found in any format")
-                        return "Error: TicketCount parameter is required for TicketCreate transaction"
-                        
-                elif tx_details["TransactionType"].lower() == "Payment".lower():
-                    destination, found_dest = get_parameter_case_insensitive(tx_details["Parameters"], "Destination")
-                    amount, found_amount = get_parameter_case_insensitive(tx_details["Parameters"], "Amount")
-                    if not (found_dest and found_amount):
-                        missing = []
-                        if not found_dest: missing.append("Destination")
-                        if not found_amount: missing.append("Amount")
-                        return f"Error: Missing required parameters: {', '.join(missing)}"
-                    params["Destination"] = destination
-                    params["Amount"] = amount
-                    
-                elif tx_details["TransactionType"].lower() == "NFTokenMint".lower():
-                    required_params = {
-                        "URI": "URI",
-                        "Flags": "Flags",
-                        "TransferFee": "TransferFee",
-                        "NFTokenTaxon": "NFTokenTaxon"
-                    }
-                    missing = []
-                    for param_key, param_name in required_params.items():
-                        value, found = get_parameter_case_insensitive(tx_details["Parameters"], param_name)
-                        if found:
-                            params[param_key] = value
-                        else:
-                            missing.append(param_name)
-                    if missing:
-                        return f"Error: Missing required parameters: {', '.join(missing)}"
-                        
-                elif tx_details["TransactionType"].lower() == "TrustSet".lower():
-                    limit_amount, found = get_parameter_case_insensitive(tx_details["Parameters"], "LimitAmount")
-                    if found:
-                        # Check if LimitAmount is in correct format
-                        if isinstance(limit_amount, dict) and all(k in limit_amount for k in ["currency", "issuer", "value"]):
-                            params["LimitAmount"] = {
-                                "currency": str(limit_amount["currency"]).upper(),
-                                "issuer": str(limit_amount["issuer"]),
-                                "value": str(limit_amount["value"])  # Ensure value is string
-                            }
-                        else:
-                            return "Error: LimitAmount must contain currency, issuer, and value"
-                    else:
-                        return "Error: LimitAmount parameter is required for TrustSet transaction"
-            
-            logger.debug(f"Created transaction parameters: {params}")
-
-            return f"""Here's the transaction payload for {params['TransactionType']}:
+        return f"""Here's the transaction payload:
 ```json
-{json.dumps(params, indent=2)}
-
+{json.dumps(tx_json, indent=2)}
 ```
 Would you like me to prepare and submit this transaction?"""
                 
@@ -975,20 +865,29 @@ def get_wallet(address):
 
 
 async def process_transaction():
-    logger.debug("Preparing transaction")
-    prepared_tx = await prepare_transaction(
-        st.session_state.review_state["transaction"]["TransactionType"],
-        st.session_state.review_state["transaction"],
-        st.session_state.xrpl_client,
-        st.session_state.wallet
-    )
-    logger.debug("Submitting transaction")
-    result = await submit_transaction(
-        prepared_tx,
-        st.session_state.xrpl_client,
-        st.session_state.wallet
-    )
-    return result
+    logger.debug("Starting process_transaction")
+    logger.debug(f"Transaction data from session state: {st.session_state.review_state['transaction']}")
+    
+    try:
+        logger.debug("Preparing transaction")
+        prepared_tx = await prepare_transaction(
+            st.session_state.review_state["transaction"],
+            st.session_state.xrpl_client,
+            st.session_state.wallet
+        )
+        logger.debug(f"Prepared transaction: {prepared_tx.to_dict() if prepared_tx else 'None'}")
+        
+        logger.debug("Submitting transaction")
+        result = await submit_transaction(
+            prepared_tx,
+            st.session_state.xrpl_client,
+            st.session_state.wallet
+        )
+        logger.debug(f"Submit result: {result}")
+        return result
+    except Exception as e:
+        logger.error(f"Error in process_transaction: {str(e)}", exc_info=True)
+        raise
 
 # Chat interface section starts here
 logger.debug("Initializing chat interface")
@@ -1156,10 +1055,16 @@ if st.session_state.last_response and "```json" in st.session_state.last_respons
         # Extract transaction data only once
         if not st.session_state.review_state["transaction"]:
             try:
+                # Extract the raw JSON from the response
                 json_str = st.session_state.last_response[st.session_state.last_response.find("```json") + 7 : st.session_state.last_response.rfind("```")].strip()
-                tx_data = json.loads(json_str)
-                st.session_state.review_state["transaction"] = tx_data
-                logger.debug(f"Stored transaction data: {tx_data}")
+                logger.debug(f"Extracted JSON: {json_str}")
+                
+                # Just parse the JSON directly since it's already in lowercase
+                tx_json = json.loads(json_str)
+                
+                # Store the complete transaction JSON
+                st.session_state.review_state["transaction"] = tx_json
+                logger.debug(f"Stored transaction JSON: {tx_json}")
             except Exception as e:
                 logger.error(f"Error parsing JSON: {e}")
                 st.error("Error parsing transaction data")
