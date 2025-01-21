@@ -32,6 +32,8 @@ from datetime import datetime
 import re
 from pymongo import MongoClient
 from pathlib import Path
+from xrpl.models.transactions import Transaction
+from xrpl.models.transactions.transaction import TransactionType
 
 # Enhanced logging setup
 logger.remove()
@@ -527,6 +529,60 @@ async def process_multiple_documents(files) -> List[Tuple[str, bool]]:
     logger.info(f"Processed {len(processed_results)} documents")
     return processed_results
 
+async def get_transaction_parameters_info(transaction_type: TransactionType) -> list:
+    """Get parameter information for a specific transaction type from AstraDB"""
+    vector_store = initialize_vector_store()
+    
+    # Query to find relevant chunks about the transaction parameters
+    query = f"What are the required and optional parameters for {transaction_type} transaction?"
+    logger.debug(f"Querying vector store for {transaction_type} parameters")
+    
+    try:
+        retriever = vector_store.as_retriever(search_kwargs={"k": 5})
+        relevant_docs = await asyncio.to_thread(retriever.get_relevant_documents, query)
+        logger.debug(f"Found {len(relevant_docs)} relevant documents")
+        return relevant_docs
+    except Exception as e:
+        logger.error(f"Error retrieving parameter info: {e}")
+        raise
+
+async def validate_transaction_parameters(tx_json: dict, context_docs: list) -> tuple[bool, str]:
+    """Validate transaction parameters using LLM and context"""
+    validation_prompt = ChatPromptTemplate.from_messages([
+        ("system", """
+        You are a transaction validator. Using the provided context about transaction parameters,
+        check if the transaction JSON has all required fields with valid values.
+        
+        If any required parameters are missing or invalid, explain what's missing and how to provide it.
+        If all required parameters are present and valid, confirm it's ready for submission.
+        
+        Context about parameters:
+        {context}
+        
+        Transaction JSON:
+        {transaction}
+        """),
+        ("human", "Is this transaction complete and valid?")
+    ])
+    
+    # Combine context documents
+    context = "\n\n".join(doc.page_content for doc in context_docs)
+    
+    try:
+        formatted_prompt = await validation_prompt.ainvoke({
+            "context": context,
+            "transaction": json.dumps(tx_json, indent=2)
+        })
+        response = await llm.ainvoke(formatted_prompt)
+        
+        # Check if response indicates missing parameters
+        is_valid = "ready for submission" in response.content.lower()
+        return is_valid, response.content
+        
+    except Exception as e:
+        logger.error(f"Error validating parameters: {e}")
+        raise
+
 
 
 async def transaction_request(question):
@@ -536,7 +592,45 @@ async def transaction_request(question):
 
         wallet = st.session_state.wallet
 
-        # Extract transaction details from question using LLM
+        # Check if we're in a follow-up conversation about parameters
+        if "pending_transaction" in st.session_state:
+            # Extract parameter values from the user's response
+            param_prompt = ChatPromptTemplate.from_messages([
+                ("system", """
+                Extract parameter values from the user's response.
+                Return them as a JSON object matching the parameter names exactly.
+                """),
+                ("human", "{text}")
+            ])
+            
+            formatted_prompt = await param_prompt.ainvoke({"text": question})
+            response = await llm.ainvoke(formatted_prompt)
+            new_params = json.loads(response.content)
+            
+            # Update the pending transaction with new parameters
+            tx_json = {
+                **st.session_state.pending_transaction,
+                **new_params
+            }
+            
+            # Validate updated transaction
+            parameter_docs = await get_transaction_parameters_info(TransactionType[tx_json["TransactionType"]])
+            is_valid, validation_message = await validate_transaction_parameters(tx_json, parameter_docs)
+            
+            if not is_valid:
+                # Still missing parameters
+                st.session_state.pending_transaction = tx_json
+                return validation_message
+            
+            # All parameters are valid
+            del st.session_state.pending_transaction
+            return f"""Here's the complete transaction payload:
+```json
+{json.dumps(tx_json, indent=2)}
+```
+Would you like me to prepare and submit this transaction?"""
+
+        # New transaction request
         tx_prompt = ChatPromptTemplate.from_messages([
             ("system", """
             Extract transaction details from the user request. Return a valid JSON object with:
@@ -547,38 +641,56 @@ async def transaction_request(question):
             Supported types: TicketCreate, Payment, NFTokenMint, TrustSet  # Proper case for transaction types
             Note: transaction_type should be in proper case (e.g., TicketCreate, not ticketcreate or Ticketcreate. its your job to change it to correct case)
             Note: All the parameters should be in lower case (e.g., ticket_count, not TicketCount) Its your job to change it to correct format.
+            Dont add any parameters that are not mentioned in the user request.
             """),
             ("human", "{text}")
         ])
-
-        # Get transaction details from LLM
+        
         formatted_prompt = await tx_prompt.ainvoke({"text": question})
         response = await llm.ainvoke(formatted_prompt)
         
-        logger.debug(f"LLM response: {response}")
-
-        # Clean the response content
+        # Clean and parse the JSON
         content = response.content.strip()
         if content.startswith("```json"):
-            content = content[7:]  # Remove ```json
+            content = content[7:]
         if content.endswith("```"):
-            content = content[:-3]  # Remove ```
-        content = content.strip()
-        
-        logger.debug(f"Cleaned JSON content: {content}")
-        
-        # Parse the response
-        tx_details = json.loads(content)
-        
-        # Add the Account field to the transaction
+            content = content[:-3]
+        initial_json = json.loads(content.strip()) #converting to python dictionary
+
         tx_json = {
-            "transaction_type": tx_details["transaction_type"],
+            "transaction_type": initial_json["transaction_type"],
             "account": wallet.classic_address,
-            **tx_details["Parameters"]  # Keep original parameter case
+            **initial_json["Parameters"]  
         }
+        logger.debug(f"Initial JSON: {initial_json}")
+        
+      
+        transaction_type = tx_json.get('transaction_type', 'UNKNOWN') 
+        logger.debug(f"Identified transaction type: {transaction_type}")
+        
+        # Get parameter information from AstraDB
+        parameter_docs = await get_transaction_parameters_info(transaction_type)
+        
+        # Create initial transaction JSON with any provided parameters
+        #tx_json = {
+        #    "TransactionType": transaction_type.name,
+        #    "Account": wallet.classic_address,
+        #    **{k: v for k, v in initial_json.items() 
+        #       if k not in ["TransactionType", "Account"]}
+        #}
+        
+        # Validate parameters
+        is_valid, validation_message = await validate_transaction_parameters(tx_json, parameter_docs)
+        
+        if not is_valid:
+            # Store the pending transaction
+            st.session_state.pending_transaction = tx_json
+            return f"""This transaction needs more information:
+            
+{validation_message}
 
-        logger.debug(f"Created transaction JSON: {tx_json}")
-
+Please provide the missing information and I'll help you prepare the transaction."""
+        
         return f"""Here's the transaction payload:
 ```json
 {json.dumps(tx_json, indent=2)}
