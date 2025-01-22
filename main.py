@@ -77,6 +77,7 @@ ASTRA_DB_API_ENDPOINT = os.getenv("ASTRA_DB_API_ENDPOINT")
 ASTRA_DB_NAMESPACE = os.getenv("ASTRA_DB_NAMESPACE")
 COLLECTION_NAME = "xrpl_ai_coll"
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+logger.debug(f"Google API Key: {GOOGLE_API_KEY}")
 MODEL_NAME = "gemini-1.5-pro-002"
 EMBEDDING_MODEL = "models/embedding-001"
 XRPL_TESTNET_URL = "https://s.altnet.rippletest.net:51234/"
@@ -547,7 +548,6 @@ async def get_transaction_parameters_info(transaction_type: TransactionType) -> 
         raise
 
 async def validate_transaction_parameters(tx_json: dict, context_docs: list) -> tuple[bool, str]:
-    """Validate transaction parameters using LLM and context"""
     validation_prompt = ChatPromptTemplate.from_messages([
         ("system", """
         You are a transaction validator. Using the provided context about transaction parameters,
@@ -555,6 +555,8 @@ async def validate_transaction_parameters(tx_json: dict, context_docs: list) -> 
         
         If any required parameters are missing or invalid, explain what's missing and how to provide it.
         If all required parameters are present and valid, confirm it's ready for submission.
+        
+        When parameters are missing, start your response with "I'm waiting for the following parameters:"
         
         Context about parameters:
         {context}
@@ -593,44 +595,74 @@ async def transaction_request(question):
         wallet = st.session_state.wallet
 
         # Check if we're in a follow-up conversation about parameters
-        if "pending_transaction" in st.session_state:
-            # Extract parameter values from the user's response
+        if "pending_transaction" in st.session_state and "transaction payload" not in question.lower():
+            logger.debug("Treating as parameter update for pending transaction")
+            pending_type = st.session_state.pending_transaction.get('transaction_type', 'UNKNOWN')
+            logger.debug(f"Pending transaction type: {pending_type}")
+            
             param_prompt = ChatPromptTemplate.from_messages([
                 ("system", """
-                Extract parameter values from the user's response.
-                Return them as a JSON object matching the parameter names exactly.
+                The user is providing parameters for a pending transaction.
+                Extract any parameter values mentioned and return a JSON object.
+                Include only the parameters mentioned by the user.
+                Do not include markdown code block markers or any other text.
+                Example: If user says "ticket count is 2", return:
+                {{
+                    "Parameters": {{ "ticket_count": 2 }}
+                }}
+                Note: All the parameters should be in lower case (e.g., ticket_count, not TicketCount) Its your job to change it to correct format.
                 """),
                 ("human", "{text}")
             ])
             
             formatted_prompt = await param_prompt.ainvoke({"text": question})
             response = await llm.ainvoke(formatted_prompt)
-            new_params = json.loads(response.content)
+            logger.debug(f"Follow-up response: {response.content}")
             
-            # Update the pending transaction with new parameters
-            tx_json = {
-                **st.session_state.pending_transaction,
-                **new_params
-            }
+            # Clean the content
+            content = response.content.strip()
+            if content.startswith("```json"):
+                content = content[7:]
+            if content.endswith("```"):
+                content = content[:-3]
+            content = content.strip()  # Strip again after removing markers
             
-            # Validate updated transaction
-            parameter_docs = await get_transaction_parameters_info(TransactionType[tx_json["TransactionType"]])
-            is_valid, validation_message = await validate_transaction_parameters(tx_json, parameter_docs)
+            logger.debug(f"Cleaned content before parsing: {content}")
             
-            if not is_valid:
-                # Still missing parameters
-                st.session_state.pending_transaction = tx_json
-                return validation_message
-            
-            # All parameters are valid
-            del st.session_state.pending_transaction
-            return f"""Here's the complete transaction payload:
+            try:
+                new_params = json.loads(content)  # Use cleaned content here
+                logger.debug(f"New parameters: {new_params}")
+                
+                # Update the pending transaction with new parameters
+                tx_json = {
+                    **st.session_state.pending_transaction,
+                    **new_params["Parameters"]
+                }
+                logger.debug(f"Updated transaction: {tx_json}")
+                
+                # Validate updated transaction
+                parameter_docs = await get_transaction_parameters_info(tx_json.get('transaction_type', 'UNKNOWN') )
+                is_valid, validation_message = await validate_transaction_parameters(tx_json, parameter_docs)
+                
+                if not is_valid:
+                    # Still missing parameters
+                    st.session_state.pending_transaction = tx_json
+                    return validation_message
+                
+                # All parameters are valid
+                del st.session_state.pending_transaction
+                return f"""Here's the complete transaction payload:
 ```json
 {json.dumps(tx_json, indent=2)}
 ```
 Would you like me to prepare and submit this transaction?"""
+                
+            except json.JSONDecodeError as e:
+                logger.error(f"Error parsing follow-up response: {e}")
+                return "I couldn't understand the parameter values. Please provide them in a clear format."
 
-        # New transaction request
+        # New transaction request (handles both new requests and requests during pending transactions)
+        logger.debug("Processing new transaction request")
         tx_prompt = ChatPromptTemplate.from_messages([
             ("system", """
             Extract transaction details from the user request. Return a valid JSON object with:
@@ -642,12 +674,15 @@ Would you like me to prepare and submit this transaction?"""
             Note: transaction_type should be in proper case (e.g., TicketCreate, not ticketcreate or Ticketcreate. its your job to change it to correct case)
             Note: All the parameters should be in lower case (e.g., ticket_count, not TicketCount) Its your job to change it to correct format.
             Dont add any parameters that are not mentioned in the user request.
+            Do not include markdown code block markers or any other text.
+            Just return the raw JSON object.
             """),
             ("human", "{text}")
         ])
         
         formatted_prompt = await tx_prompt.ainvoke({"text": question})
         response = await llm.ainvoke(formatted_prompt)
+        logger.debug(f"Raw LLM response: {response.content}")
         
         # Clean and parse the JSON
         content = response.content.strip()
@@ -655,7 +690,16 @@ Would you like me to prepare and submit this transaction?"""
             content = content[7:]
         if content.endswith("```"):
             content = content[:-3]
-        initial_json = json.loads(content.strip()) #converting to python dictionary
+        content = content.strip()
+        logger.debug(f"Cleaned content before parsing: {content}")
+
+        try:
+            initial_json = json.loads(content)
+            logger.debug(f"Parsed JSON: {initial_json}")
+        except json.JSONDecodeError as e:
+            logger.error(f"JSON parsing error: {str(e)}")
+            logger.error(f"Content that failed to parse: '{content}'")
+            raise
 
         tx_json = {
             "transaction_type": initial_json["transaction_type"],
@@ -670,14 +714,6 @@ Would you like me to prepare and submit this transaction?"""
         
         # Get parameter information from AstraDB
         parameter_docs = await get_transaction_parameters_info(transaction_type)
-        
-        # Create initial transaction JSON with any provided parameters
-        #tx_json = {
-        #    "TransactionType": transaction_type.name,
-        #    "Account": wallet.classic_address,
-        #    **{k: v for k, v in initial_json.items() 
-        #       if k not in ["TransactionType", "Account"]}
-        #}
         
         # Validate parameters
         is_valid, validation_message = await validate_transaction_parameters(tx_json, parameter_docs)
@@ -1140,10 +1176,12 @@ if prompt := st.chat_input("Ask about XRPL or request a transaction:"):
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         
-        # Check if it's a transaction request
-        if "transaction payload" in prompt.lower():
+        # Check if it's a transaction-related request
+        if "transaction payload" in prompt.lower() or "pending_transaction" in st.session_state:
+            logger.debug("Handling transaction request")
             response = loop.run_until_complete(transaction_request(prompt))
         else:
+            logger.debug("Handling general chat request")
             response = loop.run_until_complete(chat_with_knowledge_base(prompt))
         
         loop.close()
